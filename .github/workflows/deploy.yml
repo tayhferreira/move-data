@@ -10,62 +10,115 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Instalar dependências
-      run: |
-        pip install poetry
-        poetry install --no-root
+      - name: Instalar dependências
+        run: |
+          pip install poetry
+          poetry install --no-root
 
-    - name: Executar testes
-      run: poetry run pytest
+      - name: Executar testes
+        run: poetry run pytest
 
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Login no Container Registry
-      run: |
-        docker login https://${{ env.REGISTRY }} \
-          -u ${{ secrets.MGC_REGISTRY_USER }} \
-          -p ${{ secrets.MGC_REGISTRY_PASSWORD }}
+      - name: Login no Container Registry
+        env:
+          REGISTRY_USER: ${{ secrets.MGC_REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.MGC_REGISTRY_PASSWORD }}
+        run: |
+          echo "$REGISTRY_PASSWORD" | docker login "${{ env.REGISTRY }}" \
+            --username "$REGISTRY_USER" \
+            --password-stdin
 
-    - name: Build e push da imagem
-      run: |
-        IMAGE=${{ env.REGISTRY }}/${{ secrets.MGC_REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:latest
-        docker build -t $IMAGE .
-        docker push $IMAGE
+      - name: Build e push da imagem
+        env:
+          REGISTRY_NAME: ${{ secrets.MGC_REGISTRY_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${REGISTRY_NAME}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
 
-    - name: Configurar kubectl
-      run: |
-        echo "${{ secrets.MGC_KUBECONFIG }}" > kubeconfig.yaml
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
 
-    - name: Criar Secret do registry
-      run: |
-        export KUBECONFIG=kubeconfig.yaml
-        kubectl create secret docker-registry registry-secret \
-          --docker-server=${{ env.REGISTRY }} \
-          --docker-username=${{ secrets.MGC_REGISTRY_USER }} \
-          --docker-password=${{ secrets.MGC_REGISTRY_PASSWORD }} \
-          --dry-run=client -o yaml | kubectl apply -f -
-          
-    - name: Criar Secret do banco
-      run: |
-        export KUBECONFIG=kubeconfig.yaml
-        kubectl create secret generic db-secret \
-          --from-literal=url=${{ secrets.DATABASE_URL }} \
-          --dry-run=client -o yaml | kubectl apply -f -
+      - name: Configurar kubectl
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.MGC_KUBECONFIG }}
+        run: |
+          printf '%s' "$KUBECONFIG_CONTENT" > kubeconfig.yaml
+          chmod 600 kubeconfig.yaml
 
-    - name: Deploy no Kubernetes
-      run: |
-        export KUBECONFIG=kubeconfig.yaml
-        export MGC_REGISTRY_NAME=${{ secrets.MGC_REGISTRY_NAME }}
-        envsubst < k8s/app.yaml | kubectl apply -f -
-        kubectl rollout status deployment/cloud-application
+      - name: Testar conexão com o cluster
+        env:
+          KUBECONFIG: kubeconfig.yaml
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Criar Secret do registry
+        env:
+          KUBECONFIG: kubeconfig.yaml
+          REGISTRY_USER: ${{ secrets.MGC_REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.MGC_REGISTRY_PASSWORD }}
+        run: |
+          kubectl create secret docker-registry registry-secret \
+            --docker-server="${{ env.REGISTRY }}" \
+            --docker-username="$REGISTRY_USER" \
+            --docker-password="$REGISTRY_PASSWORD" \
+            --namespace=default \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Criar Secret do banco
+        env:
+          KUBECONFIG: kubeconfig.yaml
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          kubectl create secret generic db-secret \
+            --from-literal=url="$DATABASE_URL" \
+            --namespace=default \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Deploy no Kubernetes
+        env:
+          KUBECONFIG: kubeconfig.yaml
+          MGC_REGISTRY_NAME: ${{ secrets.MGC_REGISTRY_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          envsubst '${MGC_REGISTRY_NAME} ${IMAGE_TAG}' \
+            < k8s/app.yaml \
+            | kubectl apply -f -
+
+          kubectl rollout status deployment/cloud-application \
+            --namespace=default \
+            --timeout=300s
+
+      - name: Diagnóstico em caso de falha
+        if: failure()
+        env:
+          KUBECONFIG: kubeconfig.yaml
+        run: |
+          echo "=== Deployment ==="
+          kubectl describe deployment cloud-application -n default || true
+
+          echo "=== Pods ==="
+          kubectl get pods -n default -o wide || true
+
+          echo "=== Eventos dos Pods ==="
+          kubectl describe pods -n default -l app=cloud-application || true
+
+          echo "=== Eventos recentes ==="
+          kubectl get events -n default \
+            --sort-by=.metadata.creationTimestamp | tail -50 || true
